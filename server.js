@@ -302,76 +302,90 @@ async function generateBingoBoard(boardName, reqBody) {
   const data = img.replace(/^data:image\/\w+;base64,/, "");
   return Buffer.from(data, "base64");
 }
-async function fetchSearchResults(inputValue) {
+// Browser-like headers: Goodreads rejects the default node-fetch user agent.
+const FETCH_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+// Goodreads cover URLs carry a size marker like "._SY75_." Strip it for full size.
+const fullSizeCover = (url) =>
+  typeof url === "string" ? url.replace(/\._[^/]*?_\./, ".") : null;
+
+// Primary source: Goodreads' JSON autocomplete endpoint. Its search *page* was
+// redesigned on 2026-11-01, which broke the old HTML scraper.
+async function searchGoodreads(query) {
   const response = await fetch(
-    `https://www.goodreads.com/search?utf8=%E2%9C%93&q=${inputValue}&search_type=books&per_page=10`
+    `https://www.goodreads.com/book/auto_complete?format=json&q=${encodeURIComponent(query)}`,
+    { headers: { ...FETCH_HEADERS, Accept: "application/json" } }
   );
-  const body = await response.text();
+  if (!response.ok) throw new Error(`Goodreads returned ${response.status}`);
+  const books = await response.json();
+  if (!Array.isArray(books)) throw new Error("Goodreads returned an unexpected format");
 
-  const $ = cheerio.load(body);
-
-  const processBookTitles = () => {
-    const titles = {};
-    $(".bookTitle").each((i, title) => {
-      titles[i] = {
-        id: i,
-        title: $(title).text().trim()
-      };
-    });
-    return titles;
-  };
-
-  const processAuthors = () => {
-    const authors = {};
-    $("*[itemprop = 'author']").each((i, author) => {
-      authors[i] = $(author).text().split("(")[0].trim().replace(/\n\n\n/g, "");
-    });
-    return authors;
-  };
-
-  const processCovers = () => {
-    const covers = {};
-    $(".bookCover").each((i, cover) => {
-      covers[i] = $(cover).attr("src").replace(/_[^]+_./g, "");
-    });
-    return covers;
-  };
-
-  const processEditions = async () => {
-    const editions = {};
-    $("a[href^='/work/editions/']").each((i, edition) => {
-      editions[i] = $(edition).attr("href").match(/[^\D]+/g);
-    });
-    return editions;
-  };
-
-  const [titles, authors, covers, editions] = await Promise.all([
-    processBookTitles(),
-    processAuthors(),
-    processCovers(),
-    processEditions()
-  ]);
-
-  // Combine results
   const resList = {};
-  Object.keys(titles).forEach(i => {
+  books.slice(0, 10).forEach((book, i) => {
     resList[i] = {
-      ...titles[i],
-      author: authors[i],
-      imgLink: covers[i],
-      edition: editions[i][0]
+      id: i,
+      title: book.title || book.bookTitleBare || "",
+      author: (book.author && book.author.name) || "",
+      imgLink: fullSizeCover(book.imageUrl),
+      edition: book.workId ? String(book.workId) : null,
     };
   });
-
   return resList;
+}
+
+// Backup source: Open Library's free search API, used when Goodreads fails.
+async function searchOpenLibrary(query) {
+  const response = await fetch(
+    `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&limit=10&fields=title,author_name,cover_i`,
+    { headers: { "User-Agent": "BL-Book-Bingo/1.0 (personal use)" } }
+  );
+  if (!response.ok) throw new Error(`Open Library returned ${response.status}`);
+  const data = await response.json();
+
+  const resList = {};
+  (data.docs || []).forEach((book, i) => {
+    resList[i] = {
+      id: i,
+      title: book.title || "",
+      author: (book.author_name && book.author_name[0]) || "",
+      imgLink: book.cover_i
+        ? `https://covers.openlibrary.org/b/id/${book.cover_i}-L.jpg`
+        : null,
+      edition: null,
+    };
+  });
+  return resList;
+}
+
+async function fetchSearchResults(query) {
+  try {
+    const results = await searchGoodreads(query);
+    if (Object.keys(results).length > 0) return results;
+  } catch (err) {
+    console.error("Goodreads search failed, trying Open Library:", err.message);
+  }
+  try {
+    return await searchOpenLibrary(query);
+  } catch (err) {
+    console.error("Open Library search failed:", err.message);
+    return {};
+  }
 }
 
 app.get("/scrape",
   validateQuery('search_q', (val) => val && val.length > 0),
   cacheMiddleware(cache, (req) => `search_${req.query.search_q.toLowerCase().trim()}`),
   asyncHandler(async (req, res) => {
-    const resList = await fetchSearchResults(req.query.search_q);
-    res.send(cacheResponse(cache, req.cacheKey, resList));
+    const resList = await fetchSearchResults(req.query.search_q.trim());
+    // Don't cache empty results, so a temporary outage doesn't stick for an hour.
+    if (Object.keys(resList).length > 0) {
+      cacheResponse(cache, req.cacheKey, resList);
+    }
+    res.send(resList);
   })
 );
 
@@ -380,8 +394,10 @@ async function fetchAltCovers(editionId) {
   let imgSrc = null;
 
   const response = await fetch(
-    `https://www.goodreads.com/work/editions/${editionId}?sort=num_ratings&filter_by_format=Paperback&per_page=10`
+    `https://www.goodreads.com/work/editions/${encodeURIComponent(editionId)}?sort=num_ratings&filter_by_format=Paperback&per_page=10`,
+    { headers: FETCH_HEADERS }
   );
+  if (!response.ok) return resList;
   const body = await response.text();
 
   const $ = cheerio.load(body);
@@ -401,8 +417,8 @@ async function fetchAltCovers(editionId) {
     });
 
     if (englishEditionFound) {
-      imgSrc = $(element).find('img').attr('src').replace(/_[^]+_./g, "");;
-      resList.push(imgSrc);
+      imgSrc = fullSizeCover($(element).find('img').attr('src'));
+      if (imgSrc) resList.push(imgSrc);
     }
 
     if (resList.length >= 4) {
@@ -417,7 +433,12 @@ async function fetchAltCovers(editionId) {
 app.get("/altcovers",
   validateQuery('edition_id', (val) => val && val.length > 0),
   asyncHandler(async (req, res) => {
-    const resList = await fetchAltCovers(req.query.edition_id);
+    let resList = [];
+    try {
+      resList = await fetchAltCovers(req.query.edition_id);
+    } catch (err) {
+      console.error("Alt cover lookup failed:", err.message);
+    }
     res.send(resList);
   })
 );
